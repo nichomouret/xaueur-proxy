@@ -1,6 +1,5 @@
 const http = require('http');
 const https = require('https');
-
 const TD_KEY = '10b3ff3aa4b444ae85d350902c523b0f';
 const PORT = process.env.PORT || 3000;
 
@@ -17,7 +16,7 @@ function fetchURL(url) {
   });
 }
 
-// Symboles XAU/EUR testés dans l'ordre
+// ── XAU/EUR (dashboard gold) ──────────────────────────────────────────────────
 const SYMBOLS = ['XAU/EUR', 'XAUEUR'];
 
 async function getPrice() {
@@ -27,12 +26,18 @@ async function getPrice() {
       const d = await fetchURL(url);
       const p = parseFloat(d?.price);
       if (p > 100 && p < 100000) return { price: p, symbol: sym };
-      console.log(`${sym} returned invalid price: ${p} — raw: ${JSON.stringify(d)}`);
+      console.log(`${sym} returned invalid price: ${p}`);
     } catch(e) {
       console.log(`${sym} failed: ${e.message}`);
     }
   }
   throw new Error('All symbols failed');
+}
+
+// ── Proxy générique TwelveData (Short Signal) ─────────────────────────────────
+function buildTwelveDataURL(path, query) {
+  const separator = query ? '&' : '?';
+  return `https://api.twelvedata.com${path}?${query}${separator}apikey=${TD_KEY}`;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -43,10 +48,29 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
+  const [rawPath, rawQuery] = req.url.split('?');
+
+  // ── Route Short Signal : /td/* ─────────────────────────────────────────────
+  if (rawPath.startsWith('/td/')) {
+    const tdPath = rawPath.replace('/td', '');
+    const tdURL = buildTwelveDataURL(tdPath, rawQuery || '');
+    try {
+      console.log(`TwelveData proxy: GET ${tdPath}?${rawQuery}`);
+      const data = await fetchURL(tdURL);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } catch(e) {
+      console.error('TwelveData proxy error:', e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Route XAU/EUR prix spot ────────────────────────────────────────────────
   if (req.url === '/price') {
     try {
       const result = await getPrice();
-      console.log(`Price OK: ${result.price} via ${result.symbol}`);
       res.writeHead(200);
       res.end(JSON.stringify({
         price: result.price,
@@ -55,7 +79,6 @@ const server = http.createServer(async (req, res) => {
         ts: new Date().toISOString()
       }));
     } catch(e) {
-      console.error('Price error:', e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ error: 'Price unavailable', tried: SYMBOLS }));
     }
@@ -73,7 +96,7 @@ const server = http.createServer(async (req, res) => {
       }));
     } catch(e) {
       res.writeHead(200);
-      res.end(JSON.stringify({ status: 'degraded', error: e.message, tried: SYMBOLS }));
+      res.end(JSON.stringify({ status: 'degraded', error: e.message }));
     }
 
   } else if (req.url === '/debug') {
@@ -91,8 +114,8 @@ const server = http.createServer(async (req, res) => {
 
   } else {
     res.writeHead(404);
-    res.end(JSON.stringify({ error: 'Routes: /price /health /debug' }));
+    res.end(JSON.stringify({ error: 'Routes: /price /health /debug /td/*' }));
   }
 });
 
-server.listen(PORT, () => console.log(`XAU/EUR Proxy v2 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`NM Trading Proxy running on port ${PORT}`));
