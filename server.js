@@ -4,19 +4,18 @@ const TD_KEY = '10b3ff3aa4b444ae85d350902c523b0f';
 const AV_KEY = 'TQPE9U0FIFDWE8ZY';
 const PORT = process.env.PORT || 3000;
 
-// ── Generic HTTPS fetch ───────────────────────────────────────────────────────
+// ── Generic fetch ─────────────────────────────────────────────────────────────
 function fetchURL(url, extraHeaders) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/html, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/html, application/xml, */*',
         'Accept-Language': 'en-US,en;q=0.9',
         ...(extraHeaders || {})
       }
     }, (res) => {
-      // Follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         fetchURL(res.headers.location, extraHeaders).then(resolve).catch(reject);
         return;
@@ -34,7 +33,29 @@ function jp(str) { try { return JSON.parse(str); } catch(e) { return null; } }
 function today() { return new Date().toISOString().slice(0,10); }
 function daysAgo(n) { const d = new Date(); d.setDate(d.getDate()-n); return d.toISOString().slice(0,10); }
 
-// ── XAU/EUR (dashboard gold) ──────────────────────────────────────────────────
+// Parse XML/Atom simply without external lib
+function parseXMLAtom(xml) {
+  const entries = [];
+  const entryRx = /<entry>([\s\S]*?)<\/entry>/g;
+  let m;
+  while ((m = entryRx.exec(xml)) !== null) {
+    const e = m[1];
+    const get = (tag) => {
+      const rx = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
+      const match = rx.exec(e);
+      return match ? match[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').trim() : '';
+    };
+    entries.push({
+      title:   get('title'),
+      updated: get('updated'),
+      summary: get('summary'),
+      link:    (/<link[^>]+href="([^"]+)"/.exec(e) || [])[1] || ''
+    });
+  }
+  return entries;
+}
+
+// ── XAU/EUR (gold dashboard) ──────────────────────────────────────────────────
 const SYMBOLS = ['XAU/EUR','XAUEUR'];
 async function getPrice() {
   for (const sym of SYMBOLS) {
@@ -54,20 +75,125 @@ function tdURL(path, query) {
   return `https://api.twelvedata.com${path}?${query}${sep}apikey=${TD_KEY}`;
 }
 
-// ── SEC EDGAR (/sec/crossings, /sec/institutional) ────────────────────────────
+// ── Alpha Vantage (/av/*) ─────────────────────────────────────────────────────
+// /av/overview?ticker=NVDA  → full overview incl. short interest, beta, PE, analyst targets
+// /av/insiders?ticker=NVDA  → insider transactions (Form 4 equivalent)
+// /av/holders?ticker=NVDA   → institutional ownership
+
+async function avOverview(ticker) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
+    const d = jp(r.body);
+    if (!d || d.Information || d['Error Message'] || !d.Symbol) {
+      return { ticker, error: (d && (d.Information || d['Error Message'])) || 'No data', source: 'Alpha Vantage' };
+    }
+    return {
+      ticker, source: 'Alpha Vantage',
+      data: {
+        name:              d.Name || '',
+        sector:            d.Sector || '',
+        industry:          d.Industry || '',
+        description:       d.Description || '',
+        exchange:          d.Exchange || '',
+        currency:          d.Currency || '',
+        marketCap:         parseInt(d.MarketCapitalization || 0),
+        pe:                parseFloat(d.PERatio || 0),
+        forwardPE:         parseFloat(d.ForwardPE || 0),
+        eps:               parseFloat(d.EPS || 0),
+        beta:              parseFloat(d.Beta || 0),
+        high52:            parseFloat(d['52WeekHigh'] || 0),
+        low52:             parseFloat(d['52WeekLow'] || 0),
+        sharesOutstanding: parseInt(d.SharesOutstanding || 0),
+        sharesFloat:       parseInt(d.SharesFloat || 0),
+        sharesShort:       parseInt(d.SharesShort || 0),
+        sharesShortPrior:  parseInt(d.SharesShortPriorMonth || 0),
+        shortRatio:        parseFloat(d.ShortRatio || 0),          // Days To Cover
+        shortPctFloat:     parseFloat(d.ShortPercentOutstanding || 0),
+        dividendYield:     parseFloat(d.DividendYield || 0),
+        analystTarget:     parseFloat(d.AnalystTargetPrice || 0),
+        analystStrongBuy:  parseInt(d.AnalystRatingStrongBuy || 0),
+        analystBuy:        parseInt(d.AnalystRatingBuy || 0),
+        analystHold:       parseInt(d.AnalystRatingHold || 0),
+        analystSell:       parseInt(d.AnalystRatingSell || 0),
+        analystStrongSell: parseInt(d.AnalystRatingStrongSell || 0),
+        latestQuarter:     d.LatestQuarter || '',
+        revenueGrowthYOY:  parseFloat(d.QuarterlyRevenueGrowthYOY || 0),
+        earningsGrowthYOY: parseFloat(d.QuarterlyEarningsGrowthYOY || 0),
+      }
+    };
+  } catch(e) {
+    return { ticker, error: e.message, source: 'Alpha Vantage' };
+  }
+}
+
+async function avInsiders(ticker) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=INSIDER_TRANSACTIONS&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
+    const d = jp(r.body);
+    if (!d || d.Information || d['Error Message']) {
+      return { ticker, transactions: [], source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
+    }
+    const raw = d.data || d.insiderTransactions || [];
+    const transactions = raw.slice(0,20).map(t => ({
+      name:       t.executive || t.executiveName || t.name || t.insider || '',
+      title:      t.executiveTitle || t.title || t.relation || '',
+      date:       t.transactionDate || t.date || '',
+      type:       t.acquistionOrDisposal === 'A' ? 'Achat' : t.acquistionOrDisposal === 'D' ? 'Vente' : (t.transactionType || t.type || ''),
+      shares:     parseInt(t.shares || 0),
+      price:      parseFloat(t.sharePrice || t.price || 0),
+      total:      Math.round(parseInt(t.shares || 0) * parseFloat(t.sharePrice || t.price || 0)),
+      ownership:  t.ownershipType || ''
+    }));
+    const buys = transactions.filter(t => t.type === 'Achat' || t.type === 'A' || (t.type && t.type.toLowerCase().includes('buy')));
+    return { ticker, transactions, buys, total: transactions.length, source: 'Alpha Vantage' };
+  } catch(e) {
+    return { ticker, transactions: [], buys: [], error: e.message, source: 'Alpha Vantage' };
+  }
+}
+
+async function avHolders(ticker) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=INSTITUTIONAL_OWNERSHIP&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
+    const d = jp(r.body);
+    if (!d || d.Information || d['Error Message']) {
+      return { ticker, holders: [], source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
+    }
+    const raw = d.ownership || d.institutionalOwnership || d.data || [];
+    const holders = raw.slice(0,15).map(h => ({
+      name:      h.institutionName || h.organization || h.name || h.holder || '',
+      date:      h.date || h.reportDate || '',
+      shares:    parseInt(h.sharesHeld || h.position || h.shares || 0),
+      value:     parseInt(h.marketValue || h.value || 0),
+      pctHeld:   parseFloat(h.percentPortfolio || h.pctHeld || h.percentHeld || 0),
+      pctChange: parseFloat(h.changeInSharesPercent || h.pctChange || h.changePercent || 0),
+      change:    parseInt(h.changeInShares || h.change || 0)
+    }));
+    return { ticker, holders, total: holders.length, source: 'Alpha Vantage' };
+  } catch(e) {
+    return { ticker, holders: [], error: e.message, source: 'Alpha Vantage' };
+  }
+}
+
+// ── SEC EDGAR (/sec/*) ────────────────────────────────────────────────────────
 async function secCrossings(ticker) {
   try {
     const url = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(ticker)}%22&dateRange=custom&startdt=${daysAgo(90)}&enddt=${today()}&forms=SC+13D,SC+13G,SC+13G%2FA,SC+13D%2FA`;
     const r = await fetchURL(url);
     const d = jp(r.body);
     if (!d || !d.hits) return { ticker, filings: [], source: 'SEC EDGAR' };
-    const filings = (d.hits.hits || []).slice(0,10).map(h => ({
-      type:   (h._source && h._source.form_type) || '',
-      filer:  (h._source && h._source.display_names && h._source.display_names[0] && h._source.display_names[0].name) || (h._source && h._source.entity_name) || 'Unknown',
-      filed:  (h._source && h._source.file_date) || '',
-      period: (h._source && h._source.period_of_report) || '',
-      url:    `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(ticker)}%22&forms=SC+13D,SC+13G`
-    }));
+    const filings = (d.hits.hits || []).slice(0,10).map(h => {
+      const src = h._source || {};
+      const names = src.display_names || [];
+      return {
+        type:   src.form_type || '',
+        filer:  names.length > 0 ? names[0].name || '' : src.entity_name || 'Unknown',
+        filed:  src.file_date || '',
+        period: src.period_of_report || ''
+      };
+    });
     return { ticker, filings, total: (d.hits.total && d.hits.total.value) || 0, source: 'SEC EDGAR' };
   } catch(e) {
     return { ticker, filings: [], error: e.message, source: 'SEC EDGAR' };
@@ -80,201 +206,73 @@ async function secInstitutional(ticker) {
     const r = await fetchURL(url);
     const d = jp(r.body);
     if (!d || !d.hits) return { ticker, holdings: [], source: 'SEC 13F' };
-    const holdings = (d.hits.hits || []).slice(0,15).map(h => ({
-      filer:  (h._source && h._source.display_names && h._source.display_names[0] && h._source.display_names[0].name) || (h._source && h._source.entity_name) || 'Unknown',
-      filed:  (h._source && h._source.file_date) || '',
-      period: (h._source && h._source.period_of_report) || '',
-      type:   (h._source && h._source.form_type) || '13F-HR'
-    }));
+    const holdings = (d.hits.hits || []).slice(0,15).map(h => {
+      const src = h._source || {};
+      const names = src.display_names || [];
+      return {
+        filer:  names.length > 0 ? names[0].name || '' : src.entity_name || 'Unknown',
+        filed:  src.file_date || '',
+        period: src.period_of_report || '',
+        type:   src.form_type || '13F-HR'
+      };
+    });
     return { ticker, holdings, total: (d.hits.total && d.hits.total.value) || 0, source: 'SEC 13F' };
   } catch(e) {
     return { ticker, holdings: [], error: e.message, source: 'SEC 13F' };
   }
 }
 
-// ── SEC Form 4 — Insider transactions (/insider/buys, /insider/radar) ─────────
+// ── SEC EDGAR Form 4 via RSS (/insider/*) ─────────────────────────────────────
+// Uses EDGAR RSS feed which properly includes company + insider names
 async function insiderBuys(ticker) {
   try {
-    const url = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(ticker)}%22&forms=4&dateRange=custom&startdt=${daysAgo(90)}&enddt=${today()}`;
+    const url = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=&CIK=${encodeURIComponent(ticker)}&type=4&dateb=&owner=include&count=20&search_text=&output=atom`;
     const r = await fetchURL(url);
-    const d = jp(r.body);
-    if (!d || !d.hits) return { ticker, buys: [], source: 'SEC Form 4' };
-    const buys = (d.hits.hits || []).slice(0,15).map(h => ({
-      date:    (h._source && h._source.file_date) || '',
-      ticker:  ticker,
-      insider: (h._source && h._source.display_names && h._source.display_names[1] && h._source.display_names[1].name) || 'Unknown',
-      title:   (h._source && h._source.display_names && h._source.display_names[1] && h._source.display_names[1].forms && h._source.display_names[1].forms[0]) || '',
-      period:  (h._source && h._source.period_of_report) || '',
-      type:    (h._source && h._source.form_type) || '4'
-    }));
-    return { ticker, buys, total: (d.hits.total && d.hits.total.value) || 0, source: 'SEC EDGAR Form 4' };
+    const entries = parseXMLAtom(r.body);
+    const buys = entries.slice(0,15).map(e => {
+      const title = e.title || '';
+      const parts = title.split(' - ').map(p => p.trim());
+      const insider = parts.length > 1 ? parts[1].replace(/\(\d+\)/g,'').replace(/\(Issuer\)/gi,'').trim() : '';
+      const company = parts.length > 2 ? parts.slice(2).join(' - ').replace(/\(\d+\)/g,'').replace(/\(Issuer\)/gi,'').trim() : ticker;
+      return {
+        date:    e.updated ? e.updated.slice(0,10) : '',
+        ticker:  ticker,
+        insider: insider,
+        company: company,
+        summary: e.summary ? e.summary.replace(/<[^>]+>/g,'').slice(0,120).trim() : '',
+        link:    e.link || ''
+      };
+    });
+    return { ticker, buys, total: buys.length, source: 'SEC EDGAR RSS Form 4' };
   } catch(e) {
-    return { ticker, buys: [], error: e.message, source: 'SEC Form 4' };
+    return { ticker, buys: [], error: e.message, source: 'SEC EDGAR RSS' };
   }
 }
 
 async function insiderRadar() {
   try {
-    const url = `https://efts.sec.gov/LATEST/search-index?forms=4&dateRange=custom&startdt=${daysAgo(7)}&enddt=${today()}`;
+    const url = 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=30&search_text=&output=atom';
     const r = await fetchURL(url);
-    const d = jp(r.body);
-    if (!d || !d.hits) return { buys: [], source: 'SEC Form 4', asOf: today() };
-    const buys = (d.hits.hits || []).slice(0,30).map(h => {
-      const src = h._source || {};
-      const names = src.display_names || [];
-      // EDGAR display_names: array of {name, entity_id, forms:[]}
-      // First entry = company, second+ = insiders
-      const company = names.length > 0 ? names[0].name || '' : src.entity_name || '';
-      const insider = names.length > 1 ? names[1].name || '' : '';
-      const title   = names.length > 1 && names[1].forms ? names[1].forms.join(', ') : '';
+    const entries = parseXMLAtom(r.body);
+    // SEC EDGAR RSS title format: "4 - INSIDER NAME - COMPANY NAME"
+    // or "4 - COMPANY NAME (0001234) (Issuer)"
+    const buys = entries.slice(0,25).map(e => {
+      const title = e.title || '';
+      const parts = title.split(' - ').map(p => p.trim());
+      // parts[0] = form type (4), parts[1] = filer name, parts[2+] = company
+      const insider = parts.length > 1 ? parts[1].replace(/\(\d+\)/g,'').replace(/\(Issuer\)/gi,'').trim() : '';
+      const company = parts.length > 2 ? parts.slice(2).join(' - ').replace(/\(\d+\)/g,'').replace(/\(Issuer\)/gi,'').trim() : '';
       return {
-        date:    src.file_date || '',
-        company: company,
-        insider: insider,
-        title:   title,
-        period:  src.period_of_report || '',
-        ticker:  src.period_of_report || ''
+        date:    e.updated ? e.updated.slice(0,10) : '',
+        company: company || insider,
+        insider: company ? insider : '',
+        summary: e.summary ? e.summary.replace(/<[^>]+>/g,'').slice(0,120).trim() : '',
+        link:    e.link || ''
       };
     });
-    return { buys, total: (d.hits.total && d.hits.total.value) || 0, source: 'SEC EDGAR Form 4', asOf: today() };
+    return { buys, total: buys.length, source: 'SEC EDGAR RSS Form 4', asOf: today() };
   } catch(e) {
-    return { buys: [], error: e.message, source: 'SEC Form 4' };
-  }
-}
-
-// ── Alpha Vantage (/av/*) ────────────────────────────────────────────────────
-// /av/short?ticker=NVDA       → short interest + days to cover
-// /av/holders?ticker=NVDA     → top holders institutionnels
-// /av/insiders?ticker=NVDA    → transactions insiders récentes
-// /av/overview?ticker=NVDA    → overview complet société
-
-async function avShort(ticker) {
-  try {
-    // Alpha Vantage: SHORT_INTEREST endpoint
-    const url = `https://www.alphavantage.co/query?function=SHORT_INTEREST&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
-    const r = await fetchURL(url);
-    const d = jp(r.body);
-    if (!d || d.Information || d['Error Message']) {
-      // Fallback: use OVERVIEW for basic short data
-      const url2 = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
-      const r2 = await fetchURL(url2);
-      const d2 = jp(r2.body);
-      if (!d2 || d2.Information) return { ticker, shortInterest: {}, source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
-      return {
-        ticker, source: 'Alpha Vantage OVERVIEW',
-        shortInterest: {
-          sharesShort:       parseInt(d2.SharesShort || 0),
-          shortRatio:        parseFloat(d2.ShortRatio || 0),
-          shortPercentFloat: parseFloat(d2.ShortPercentOutstanding || 0),
-          lastUpdate:        d2.LatestQuarter || '',
-          sharesOutstanding: parseInt(d2.SharesOutstanding || 0),
-          float:             parseInt(d2.SharesFloat || 0),
-          forwardPE:         parseFloat(d2.ForwardPE || 0),
-          beta:              parseFloat(d2.Beta || 0),
-        }
-      };
-    }
-    const rows = (d.data || d.shortInterestData || []).slice(0,6);
-    return {
-      ticker, source: 'Alpha Vantage',
-      shortInterest: rows.map(row => ({
-        date:        row.date || row.settlementDate || '',
-        sharesShort: parseInt(row.shortInterest || row.sharesShort || 0),
-        shortRatio:  parseFloat(row.shortRatio || row.daysToCover || 0),
-        shortPct:    parseFloat(row.shortPercentFloat || 0)
-      }))
-    };
-  } catch(e) {
-    return { ticker, shortInterest: {}, error: e.message, source: 'Alpha Vantage' };
-  }
-}
-
-async function avHolders(ticker) {
-  try {
-    const url = `https://www.alphavantage.co/query?function=INSTITUTIONAL_OWNERSHIP&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
-    const r = await fetchURL(url);
-    const d = jp(r.body);
-    if (!d || d.Information || d['Error Message']) {
-      return { ticker, holders: [], source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
-    }
-    const holders = (d.ownership || d.institutionalOwnership || d.data || []).slice(0,15).map(h => ({
-      name:      h.institutionName || h.name || h.holder || '',
-      date:      h.date || h.reportDate || '',
-      shares:    parseInt(h.sharesHeld || h.shares || 0),
-      value:     parseInt(h.marketValue || h.value || 0),
-      pctHeld:   parseFloat(h.percentPortfolio || h.pctHeld || 0),
-      pctChange: parseFloat(h.changeInSharesPercent || h.pctChange || 0)
-    }));
-    return { ticker, holders, total: holders.length, source: 'Alpha Vantage' };
-  } catch(e) {
-    return { ticker, holders: [], error: e.message, source: 'Alpha Vantage' };
-  }
-}
-
-async function avInsiders(ticker) {
-  try {
-    const url = `https://www.alphavantage.co/query?function=INSIDER_TRANSACTIONS&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
-    const r = await fetchURL(url);
-    const d = jp(r.body);
-    if (!d || d.Information || d['Error Message']) {
-      return { ticker, transactions: [], source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
-    }
-    const transactions = (d.data || d.insiderTransactions || []).slice(0,15).map(t => ({
-      name:     t.executiveName || t.name || t.insider || '',
-      title:    t.executiveTitle || t.title || t.relation || '',
-      date:     t.transactionDate || t.date || '',
-      type:     t.acquistionOrDisposal === 'A' ? 'Achat' : t.acquistionOrDisposal === 'D' ? 'Vente' : t.type || '',
-      shares:   parseInt(t.shares || 0),
-      value:    parseFloat(t.sharePrice || t.price || 0),
-      total:    parseInt(t.shares || 0) * parseFloat(t.sharePrice || t.price || 0)
-    }));
-    // Filter only buys
-    const buys = transactions.filter(t => t.type === 'Achat' || t.type === 'A' || t.type.toLowerCase().includes('buy') || t.type.toLowerCase().includes('achat'));
-    return { ticker, transactions, buys, total: transactions.length, source: 'Alpha Vantage' };
-  } catch(e) {
-    return { ticker, transactions: [], buys: [], error: e.message, source: 'Alpha Vantage' };
-  }
-}
-
-async function avOverview(ticker) {
-  try {
-    const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
-    const r = await fetchURL(url);
-    const d = jp(r.body);
-    if (!d || d.Information || d['Error Message'] || !d.Symbol) {
-      return { ticker, error: (d && (d.Information || d['Error Message'])) || 'No data', source: 'Alpha Vantage' };
-    }
-    return {
-      ticker, source: 'Alpha Vantage',
-      overview: {
-        name:              d.Name || '',
-        sector:            d.Sector || '',
-        industry:          d.Industry || '',
-        marketCap:         parseInt(d.MarketCapitalization || 0),
-        pe:                parseFloat(d.PERatio || 0),
-        forwardPE:         parseFloat(d.ForwardPE || 0),
-        eps:               parseFloat(d.EPS || 0),
-        beta:              parseFloat(d.Beta || 0),
-        high52:            parseFloat(d['52WeekHigh'] || 0),
-        low52:             parseFloat(d['52WeekLow'] || 0),
-        sharesOutstanding: parseInt(d.SharesOutstanding || 0),
-        sharesFloat:       parseInt(d.SharesFloat || 0),
-        sharesShort:       parseInt(d.SharesShort || 0),
-        shortRatio:        parseFloat(d.ShortRatio || 0),
-        shortPctFloat:     parseFloat(d.ShortPercentOutstanding || 0),
-        dividendYield:     parseFloat(d.DividendYield || 0),
-        analystTarget:     parseFloat(d.AnalystTargetPrice || 0),
-        analystRating:     d.AnalystRatingStrongBuy ? {
-          strongBuy:  parseInt(d.AnalystRatingStrongBuy || 0),
-          buy:        parseInt(d.AnalystRatingBuy || 0),
-          hold:       parseInt(d.AnalystRatingHold || 0),
-          sell:       parseInt(d.AnalystRatingSell || 0),
-          strongSell: parseInt(d.AnalystRatingStrongSell || 0),
-        } : null
-      }
-    };
-  } catch(e) {
-    return { ticker, error: e.message, source: 'Alpha Vantage' };
+    return { buys: [], error: e.message, source: 'SEC EDGAR RSS' };
   }
 }
 
@@ -292,7 +290,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
 
-    // ── TwelveData (/td/*) ──────────────────────────────────────────────────
+    // TwelveData proxy
     if (rawPath.startsWith('/td/')) {
       const tdPath = rawPath.replace('/td', '');
       console.log(`[TD] ${tdPath}?${rawQuery}`);
@@ -300,7 +298,47 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200); res.end(r.body); return;
     }
 
-    // ── SEC EDGAR ──────────────────────────────────────────────────────────
+    // Alpha Vantage
+    if (rawPath === '/av/overview') {
+      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
+      console.log(`[AV] overview ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avOverview(ticker))); return;
+    }
+    if (rawPath === '/av/short') {
+      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
+      console.log(`[AV] short ${ticker}`);
+      // Extract short interest data from OVERVIEW
+      const ov = await avOverview(ticker);
+      if (ov.error) { res.writeHead(200); res.end(JSON.stringify({ticker, error: ov.error, source:'Alpha Vantage'})); return; }
+      const d = ov.data || {};
+      res.writeHead(200); res.end(JSON.stringify({
+        ticker, source: 'Alpha Vantage OVERVIEW',
+        shortInterest: {
+          sharesShort:           d.sharesShort || 0,
+          sharesShortPriorMonth: d.sharesShortPrior || 0,
+          changeVsPrior:         d.sharesShortPrior > 0 ? (((d.sharesShort - d.sharesShortPrior) / d.sharesShortPrior) * 100).toFixed(1) : 0,
+          shortRatio:            d.shortRatio || 0,
+          shortPctFloat:         d.shortPctFloat || 0,
+          floatShares:           d.sharesFloat || 0,
+          sharesOutstanding:     d.sharesOutstanding || 0,
+          lastUpdate:            d.latestQuarter || '',
+          beta:                  d.beta || 0,
+          analystTarget:         d.analystTarget || 0,
+        }
+      })); return;
+    }
+    if (rawPath === '/av/insiders') {
+      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
+      console.log(`[AV] insiders ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avInsiders(ticker))); return;
+    }
+    if (rawPath === '/av/holders') {
+      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
+      console.log(`[AV] holders ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avHolders(ticker))); return;
+    }
+
+    // SEC EDGAR institutional
     if (rawPath === '/sec/crossings') {
       if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
       console.log(`[SEC] crossings ${ticker}`);
@@ -312,7 +350,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200); res.end(JSON.stringify(await secInstitutional(ticker))); return;
     }
 
-    // ── SEC Form 4 Insiders ─────────────────────────────────────────────────
+    // SEC Form 4 insiders via RSS
     if (rawPath === '/insider/buys') {
       if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
       console.log(`[INSIDER] buys ${ticker}`);
@@ -323,29 +361,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200); res.end(JSON.stringify(await insiderRadar())); return;
     }
 
-    // ── Alpha Vantage (/av/*) ────────────────────────────────────────────────
-    if (rawPath === '/av/short') {
-      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[AV] short ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await avShort(ticker))); return;
-    }
-    if (rawPath === '/av/holders') {
-      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[AV] holders ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await avHolders(ticker))); return;
-    }
-    if (rawPath === '/av/insiders') {
-      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[AV] insiders ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await avInsiders(ticker))); return;
-    }
-    if (rawPath === '/av/overview') {
-      if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[AV] overview ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await avOverview(ticker))); return;
-    }
-
-    // ── XAU/EUR dashboard gold ──────────────────────────────────────────────
+    // XAU/EUR gold dashboard
     if (rawPath === '/price') {
       const result = await getPrice();
       res.writeHead(200);
@@ -357,14 +373,14 @@ const server = http.createServer(async (req, res) => {
       const result = await getPrice();
       res.writeHead(200);
       res.end(JSON.stringify({
-        status: 'ok', asset: 'XAU/EUR',
-        workingSymbol: result.symbol, currentPrice: result.price,
+        status: 'ok', version: 'v5',
+        asset: 'XAU/EUR', workingSymbol: result.symbol, currentPrice: result.price,
         routes: [
           '/price', '/health', '/debug',
           '/td/quote?symbol=X', '/td/time_series?symbol=X&interval=1day&outputsize=60',
+          '/av/overview?ticker=X', '/av/insiders?ticker=X', '/av/holders?ticker=X',
           '/sec/crossings?ticker=X', '/sec/institutional?ticker=X',
-          '/insider/buys?ticker=X', '/insider/radar',
-          '/av/short?ticker=X', '/av/holders?ticker=X', '/av/insiders?ticker=X', '/av/overview?ticker=X'
+          '/insider/buys?ticker=X', '/insider/radar'
         ],
         ts: new Date().toISOString()
       }));
@@ -384,8 +400,8 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(404);
     res.end(JSON.stringify({
-      error: 'Route inconnue',
-      routes: ['/price','/health','/debug','/td/quote?symbol=X','/td/time_series?symbol=X&interval=1day&outputsize=60','/sec/crossings?ticker=X','/sec/institutional?ticker=X','/insider/buys?ticker=X','/insider/radar','/av/short?ticker=X','/av/holders?ticker=X','/av/insiders?ticker=X','/av/overview?ticker=X']
+      error: 'Route inconnue', version: 'v5',
+      routes: ['/price','/health','/debug','/td/quote?symbol=X','/td/time_series?symbol=X&interval=1day&outputsize=60','/av/overview?ticker=X','/av/insiders?ticker=X','/av/holders?ticker=X','/sec/crossings?ticker=X','/sec/institutional?ticker=X','/insider/buys?ticker=X','/insider/radar']
     }));
 
   } catch(e) {
@@ -395,4 +411,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`NM Trading Proxy v4 — port ${PORT}`));
+server.listen(PORT, () => console.log(`NM Trading Proxy v5 — port ${PORT}`));
