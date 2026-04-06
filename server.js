@@ -1,6 +1,7 @@
 const http = require('http');
 const https = require('https');
 const TD_KEY = '10b3ff3aa4b444ae85d350902c523b0f';
+const AV_KEY = 'TQPE9U0FIFDWE8ZY';
 const PORT = process.env.PORT || 3000;
 
 // ── Generic HTTPS fetch ───────────────────────────────────────────────────────
@@ -118,139 +119,162 @@ async function insiderRadar() {
     const r = await fetchURL(url);
     const d = jp(r.body);
     if (!d || !d.hits) return { buys: [], source: 'SEC Form 4', asOf: today() };
-    const buys = (d.hits.hits || []).slice(0,30).map(h => ({
-      date:    (h._source && h._source.file_date) || '',
-      company: (h._source && h._source.display_names && h._source.display_names[0] && h._source.display_names[0].name) || '',
-      insider: (h._source && h._source.display_names && h._source.display_names[1] && h._source.display_names[1].name) || '',
-      title:   (h._source && h._source.display_names && h._source.display_names[1] && h._source.display_names[1].forms && h._source.display_names[1].forms[0]) || '',
-      period:  (h._source && h._source.period_of_report) || ''
-    }));
+    const buys = (d.hits.hits || []).slice(0,30).map(h => {
+      const src = h._source || {};
+      const names = src.display_names || [];
+      // EDGAR display_names: array of {name, entity_id, forms:[]}
+      // First entry = company, second+ = insiders
+      const company = names.length > 0 ? names[0].name || '' : src.entity_name || '';
+      const insider = names.length > 1 ? names[1].name || '' : '';
+      const title   = names.length > 1 && names[1].forms ? names[1].forms.join(', ') : '';
+      return {
+        date:    src.file_date || '',
+        company: company,
+        insider: insider,
+        title:   title,
+        period:  src.period_of_report || '',
+        ticker:  src.period_of_report || ''
+      };
+    });
     return { buys, total: (d.hits.total && d.hits.total.value) || 0, source: 'SEC EDGAR Form 4', asOf: today() };
   } catch(e) {
     return { buys: [], error: e.message, source: 'SEC Form 4' };
   }
 }
 
-// ── Yahoo Finance (/yahoo/*) ──────────────────────────────────────────────────
-// /yahoo/quote?ticker=NVDA          → quote complet avec shortRatio, shortPercent
-// /yahoo/short?ticker=NVDA          → données short interest extraites du quote
-// /yahoo/insiders?ticker=NVDA       → transactions insiders récentes
-// /yahoo/holders?ticker=NVDA        → principaux actionnaires institutionnels
+// ── Alpha Vantage (/av/*) ────────────────────────────────────────────────────
+// /av/short?ticker=NVDA       → short interest + days to cover
+// /av/holders?ticker=NVDA     → top holders institutionnels
+// /av/insiders?ticker=NVDA    → transactions insiders récentes
+// /av/overview?ticker=NVDA    → overview complet société
 
-async function yahooQuote(ticker) {
+async function avShort(ticker) {
   try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=summaryDetail,defaultKeyStatistics,institutionOwnership,insiderHolders,insiderTransactions`;
-    const r = await fetchURL(url, { 'Accept': 'application/json' });
+    // Alpha Vantage: SHORT_INTEREST endpoint
+    const url = `https://www.alphavantage.co/query?function=SHORT_INTEREST&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
     const d = jp(r.body);
-    if (!d || !d.quoteSummary || d.quoteSummary.error) {
-      return { ticker, error: (d && d.quoteSummary && d.quoteSummary.error && d.quoteSummary.error.description) || 'Yahoo Finance unavailable', source: 'Yahoo Finance' };
+    if (!d || d.Information || d['Error Message']) {
+      // Fallback: use OVERVIEW for basic short data
+      const url2 = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+      const r2 = await fetchURL(url2);
+      const d2 = jp(r2.body);
+      if (!d2 || d2.Information) return { ticker, shortInterest: {}, source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
+      return {
+        ticker, source: 'Alpha Vantage OVERVIEW',
+        shortInterest: {
+          sharesShort:       parseInt(d2.SharesShort || 0),
+          shortRatio:        parseFloat(d2.ShortRatio || 0),
+          shortPercentFloat: parseFloat(d2.ShortPercentOutstanding || 0),
+          lastUpdate:        d2.LatestQuarter || '',
+          sharesOutstanding: parseInt(d2.SharesOutstanding || 0),
+          float:             parseInt(d2.SharesFloat || 0),
+          forwardPE:         parseFloat(d2.ForwardPE || 0),
+          beta:              parseFloat(d2.Beta || 0),
+        }
+      };
     }
-    return { ticker, data: d.quoteSummary.result && d.quoteSummary.result[0], source: 'Yahoo Finance' };
+    const rows = (d.data || d.shortInterestData || []).slice(0,6);
+    return {
+      ticker, source: 'Alpha Vantage',
+      shortInterest: rows.map(row => ({
+        date:        row.date || row.settlementDate || '',
+        sharesShort: parseInt(row.shortInterest || row.sharesShort || 0),
+        shortRatio:  parseFloat(row.shortRatio || row.daysToCover || 0),
+        shortPct:    parseFloat(row.shortPercentFloat || 0)
+      }))
+    };
   } catch(e) {
-    return { ticker, error: e.message, source: 'Yahoo Finance' };
+    return { ticker, shortInterest: {}, error: e.message, source: 'Alpha Vantage' };
   }
 }
 
-async function yahooShort(ticker) {
+async function avHolders(ticker) {
   try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=defaultKeyStatistics,summaryDetail`;
-    const r = await fetchURL(url, { 'Accept': 'application/json' });
+    const url = `https://www.alphavantage.co/query?function=INSTITUTIONAL_OWNERSHIP&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
     const d = jp(r.body);
-    if (!d || !d.quoteSummary || d.quoteSummary.error) {
-      return { ticker, error: 'Yahoo Finance unavailable', source: 'Yahoo Finance' };
+    if (!d || d.Information || d['Error Message']) {
+      return { ticker, holders: [], source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
     }
-    const result = d.quoteSummary.result && d.quoteSummary.result[0];
-    const ks = (result && result.defaultKeyStatistics) || {};
-    const sd = (result && result.summaryDetail) || {};
+    const holders = (d.ownership || d.institutionalOwnership || d.data || []).slice(0,15).map(h => ({
+      name:      h.institutionName || h.name || h.holder || '',
+      date:      h.date || h.reportDate || '',
+      shares:    parseInt(h.sharesHeld || h.shares || 0),
+      value:     parseInt(h.marketValue || h.value || 0),
+      pctHeld:   parseFloat(h.percentPortfolio || h.pctHeld || 0),
+      pctChange: parseFloat(h.changeInSharesPercent || h.pctChange || 0)
+    }));
+    return { ticker, holders, total: holders.length, source: 'Alpha Vantage' };
+  } catch(e) {
+    return { ticker, holders: [], error: e.message, source: 'Alpha Vantage' };
+  }
+}
+
+async function avInsiders(ticker) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=INSIDER_TRANSACTIONS&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
+    const d = jp(r.body);
+    if (!d || d.Information || d['Error Message']) {
+      return { ticker, transactions: [], source: 'Alpha Vantage', note: d && (d.Information || d['Error Message']) };
+    }
+    const transactions = (d.data || d.insiderTransactions || []).slice(0,15).map(t => ({
+      name:     t.executiveName || t.name || t.insider || '',
+      title:    t.executiveTitle || t.title || t.relation || '',
+      date:     t.transactionDate || t.date || '',
+      type:     t.acquistionOrDisposal === 'A' ? 'Achat' : t.acquistionOrDisposal === 'D' ? 'Vente' : t.type || '',
+      shares:   parseInt(t.shares || 0),
+      value:    parseFloat(t.sharePrice || t.price || 0),
+      total:    parseInt(t.shares || 0) * parseFloat(t.sharePrice || t.price || 0)
+    }));
+    // Filter only buys
+    const buys = transactions.filter(t => t.type === 'Achat' || t.type === 'A' || t.type.toLowerCase().includes('buy') || t.type.toLowerCase().includes('achat'));
+    return { ticker, transactions, buys, total: transactions.length, source: 'Alpha Vantage' };
+  } catch(e) {
+    return { ticker, transactions: [], buys: [], error: e.message, source: 'Alpha Vantage' };
+  }
+}
+
+async function avOverview(ticker) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${AV_KEY}`;
+    const r = await fetchURL(url);
+    const d = jp(r.body);
+    if (!d || d.Information || d['Error Message'] || !d.Symbol) {
+      return { ticker, error: (d && (d.Information || d['Error Message'])) || 'No data', source: 'Alpha Vantage' };
+    }
     return {
-      ticker,
-      source: 'Yahoo Finance',
-      shortInterest: {
-        sharesShort:         (ks.sharesShort && ks.sharesShort.raw) || 0,
-        sharesShortPriorMonth: (ks.sharesShortPriorMonth && ks.sharesShortPriorMonth.raw) || 0,
-        shortRatio:          (ks.shortRatio && ks.shortRatio.raw) || 0,        // Days To Cover
-        shortPercentFloat:   (ks.shortPercentOfFloat && ks.shortPercentOfFloat.raw) || 0,
-        shortPercentShares:  (ks.sharesPercentSharesOut && ks.sharesPercentSharesOut.raw) || 0,
-        lastUpdate:          (ks.dateShortInterest && new Date(ks.dateShortInterest.raw * 1000).toISOString().slice(0,10)) || '',
-        float:               (ks.floatShares && ks.floatShares.raw) || 0,
-        sharesOutstanding:   (ks.sharesOutstanding && ks.sharesOutstanding.raw) || 0,
+      ticker, source: 'Alpha Vantage',
+      overview: {
+        name:              d.Name || '',
+        sector:            d.Sector || '',
+        industry:          d.Industry || '',
+        marketCap:         parseInt(d.MarketCapitalization || 0),
+        pe:                parseFloat(d.PERatio || 0),
+        forwardPE:         parseFloat(d.ForwardPE || 0),
+        eps:               parseFloat(d.EPS || 0),
+        beta:              parseFloat(d.Beta || 0),
+        high52:            parseFloat(d['52WeekHigh'] || 0),
+        low52:             parseFloat(d['52WeekLow'] || 0),
+        sharesOutstanding: parseInt(d.SharesOutstanding || 0),
+        sharesFloat:       parseInt(d.SharesFloat || 0),
+        sharesShort:       parseInt(d.SharesShort || 0),
+        shortRatio:        parseFloat(d.ShortRatio || 0),
+        shortPctFloat:     parseFloat(d.ShortPercentOutstanding || 0),
+        dividendYield:     parseFloat(d.DividendYield || 0),
+        analystTarget:     parseFloat(d.AnalystTargetPrice || 0),
+        analystRating:     d.AnalystRatingStrongBuy ? {
+          strongBuy:  parseInt(d.AnalystRatingStrongBuy || 0),
+          buy:        parseInt(d.AnalystRatingBuy || 0),
+          hold:       parseInt(d.AnalystRatingHold || 0),
+          sell:       parseInt(d.AnalystRatingSell || 0),
+          strongSell: parseInt(d.AnalystRatingStrongSell || 0),
+        } : null
       }
     };
   } catch(e) {
-    return { ticker, error: e.message, source: 'Yahoo Finance' };
-  }
-}
-
-async function yahooInsiders(ticker) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=insiderTransactions,insiderHolders`;
-    const r = await fetchURL(url, { 'Accept': 'application/json' });
-    const d = jp(r.body);
-    if (!d || !d.quoteSummary || d.quoteSummary.error) {
-      return { ticker, transactions: [], holders: [], source: 'Yahoo Finance' };
-    }
-    const result = d.quoteSummary.result && d.quoteSummary.result[0];
-    const it = (result && result.insiderTransactions && result.insiderTransactions.transactions) || [];
-    const ih = (result && result.insiderHolders && result.insiderHolders.holders) || [];
-
-    const transactions = it.slice(0,15).map(t => ({
-      name:        (t.filerName && t.filerName.raw) || t.filerName || '',
-      relation:    (t.filerRelation && t.filerRelation.raw) || t.filerRelation || '',
-      date:        (t.startDate && new Date(t.startDate.raw * 1000).toISOString().slice(0,10)) || '',
-      shares:      (t.shares && t.shares.raw) || 0,
-      value:       (t.value && t.value.raw) || 0,
-      type:        (t.transactionText && t.transactionText.raw) || t.transactionText || '',
-      ownership:   (t.ownership && t.ownership.raw) || t.ownership || ''
-    }));
-
-    const holders = ih.slice(0,10).map(h => ({
-      name:          (h.name && h.name.raw) || h.name || '',
-      relation:      (h.relation && h.relation.raw) || h.relation || '',
-      date:          (h.latestTransDate && new Date(h.latestTransDate.raw * 1000).toISOString().slice(0,10)) || '',
-      shares:        (h.positionDirect && h.positionDirect.raw) || 0,
-      pctHeld:       (h.pctHeld && h.pctHeld.raw) || 0,
-      pctChange:     (h.pctChange && h.pctChange.raw) || 0
-    }));
-
-    return { ticker, transactions, holders, source: 'Yahoo Finance' };
-  } catch(e) {
-    return { ticker, transactions: [], holders: [], error: e.message, source: 'Yahoo Finance' };
-  }
-}
-
-async function yahooHolders(ticker) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=institutionOwnership,majorHoldersBreakdown`;
-    const r = await fetchURL(url, { 'Accept': 'application/json' });
-    const d = jp(r.body);
-    if (!d || !d.quoteSummary || d.quoteSummary.error) {
-      return { ticker, holders: [], source: 'Yahoo Finance' };
-    }
-    const result = d.quoteSummary.result && d.quoteSummary.result[0];
-    const io = (result && result.institutionOwnership && result.institutionOwnership.ownershipList) || [];
-    const mh = (result && result.majorHoldersBreakdown) || {};
-
-    const holders = io.slice(0,15).map(h => ({
-      name:      (h.organization && h.organization.raw) || h.organization || '',
-      date:      (h.reportDate && new Date(h.reportDate.raw * 1000).toISOString().slice(0,10)) || '',
-      shares:    (h.position && h.position.raw) || 0,
-      value:     (h.value && h.value.raw) || 0,
-      pctHeld:   (h.pctHeld && h.pctHeld.raw) || 0,
-      pctChange: (h.pctChange && h.pctChange.raw) || 0
-    }));
-
-    return {
-      ticker,
-      holders,
-      summary: {
-        insiderPct:      (mh.insidersPercentHeld && mh.insidersPercentHeld.raw) || 0,
-        institutionPct:  (mh.institutionsPercentHeld && mh.institutionsPercentHeld.raw) || 0,
-        floatPct:        (mh.institutionsFloatPercentHeld && mh.institutionsFloatPercentHeld.raw) || 0,
-      },
-      source: 'Yahoo Finance'
-    };
-  } catch(e) {
-    return { ticker, holders: [], error: e.message, source: 'Yahoo Finance' };
+    return { ticker, error: e.message, source: 'Alpha Vantage' };
   }
 }
 
@@ -299,26 +323,26 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200); res.end(JSON.stringify(await insiderRadar())); return;
     }
 
-    // ── Yahoo Finance ───────────────────────────────────────────────────────
-    if (rawPath === '/yahoo/quote') {
+    // ── Alpha Vantage (/av/*) ────────────────────────────────────────────────
+    if (rawPath === '/av/short') {
       if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[YAHOO] quote ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await yahooQuote(ticker))); return;
+      console.log(`[AV] short ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avShort(ticker))); return;
     }
-    if (rawPath === '/yahoo/short') {
+    if (rawPath === '/av/holders') {
       if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[YAHOO] short ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await yahooShort(ticker))); return;
+      console.log(`[AV] holders ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avHolders(ticker))); return;
     }
-    if (rawPath === '/yahoo/insiders') {
+    if (rawPath === '/av/insiders') {
       if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[YAHOO] insiders ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await yahooInsiders(ticker))); return;
+      console.log(`[AV] insiders ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avInsiders(ticker))); return;
     }
-    if (rawPath === '/yahoo/holders') {
+    if (rawPath === '/av/overview') {
       if (!ticker) { res.writeHead(400); res.end(JSON.stringify({error:'ticker required'})); return; }
-      console.log(`[YAHOO] holders ${ticker}`);
-      res.writeHead(200); res.end(JSON.stringify(await yahooHolders(ticker))); return;
+      console.log(`[AV] overview ${ticker}`);
+      res.writeHead(200); res.end(JSON.stringify(await avOverview(ticker))); return;
     }
 
     // ── XAU/EUR dashboard gold ──────────────────────────────────────────────
@@ -340,7 +364,7 @@ const server = http.createServer(async (req, res) => {
           '/td/quote?symbol=X', '/td/time_series?symbol=X&interval=1day&outputsize=60',
           '/sec/crossings?ticker=X', '/sec/institutional?ticker=X',
           '/insider/buys?ticker=X', '/insider/radar',
-          '/yahoo/short?ticker=X', '/yahoo/insiders?ticker=X', '/yahoo/holders?ticker=X'
+          '/av/short?ticker=X', '/av/holders?ticker=X', '/av/insiders?ticker=X', '/av/overview?ticker=X'
         ],
         ts: new Date().toISOString()
       }));
@@ -361,7 +385,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404);
     res.end(JSON.stringify({
       error: 'Route inconnue',
-      routes: ['/price','/health','/debug','/td/quote?symbol=X','/td/time_series?symbol=X&interval=1day&outputsize=60','/sec/crossings?ticker=X','/sec/institutional?ticker=X','/insider/buys?ticker=X','/insider/radar','/yahoo/short?ticker=X','/yahoo/insiders?ticker=X','/yahoo/holders?ticker=X']
+      routes: ['/price','/health','/debug','/td/quote?symbol=X','/td/time_series?symbol=X&interval=1day&outputsize=60','/sec/crossings?ticker=X','/sec/institutional?ticker=X','/insider/buys?ticker=X','/insider/radar','/av/short?ticker=X','/av/holders?ticker=X','/av/insiders?ticker=X','/av/overview?ticker=X']
     }));
 
   } catch(e) {
