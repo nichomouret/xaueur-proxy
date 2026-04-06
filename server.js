@@ -369,7 +369,50 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (rawPath === '/health') {
+    // ── Claude API proxy (/claude) ─────────────────────────────────────────────
+  if (rawPath === '/claude') {
+    if (req.method !== 'POST') { res.writeHead(405); res.end(JSON.stringify({error:'POST required'})); return; }
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY || '';
+        if (!CLAUDE_KEY) { res.writeHead(500); res.end(JSON.stringify({error:'ANTHROPIC_API_KEY not set'})); return; }
+        const response = await new Promise((resolve, reject) => {
+          const data = Buffer.from(body);
+          const opts = {
+            hostname: 'api.anthropic.com',
+            path: '/v1/messages',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': data.length,
+              'x-api-key': CLAUDE_KEY,
+              'anthropic-version': '2023-06-01'
+            }
+          };
+          const r = https.request(opts, (resp) => {
+            let d = '';
+            resp.on('data', chunk => d += chunk);
+            resp.on('end', () => resolve(d));
+          });
+          r.on('error', reject);
+          r.setTimeout(30000, () => { r.destroy(); reject(new Error('Claude timeout')); });
+          r.write(data);
+          r.end();
+        });
+        res.writeHead(200);
+        res.end(response);
+      } catch(e) {
+        console.error('Claude proxy error:', e.message);
+        res.writeHead(500);
+        res.end(JSON.stringify({error: e.message}));
+      }
+    });
+    return;
+  }
+
+  if (rawPath === '/health') {
       const result = await getPrice();
       res.writeHead(200);
       res.end(JSON.stringify({
