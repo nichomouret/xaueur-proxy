@@ -57,7 +57,42 @@ function parseXMLAtom(xml) {
 
 // ── XAU/EUR (gold dashboard) ──────────────────────────────────────────────────
 const SYMBOLS = ['XAU/EUR','XAUEUR'];
+
+async function getPriceDukascopy() {
+  // Dukascopy free tick data — no cache, truly real-time
+  const ts = Date.now();
+  const url = `https://freeserv.dukascopy.com/2.0/?path=chart/json&instrument=XAU%2FUSD&offer_side=B&interval=1&time=${ts}&from=0&to=1&jsonp=cb`;
+  const urlEUR = `https://freeserv.dukascopy.com/2.0/?path=chart/json&instrument=EUR%2FUSD&offer_side=B&interval=1&time=${ts}&from=0&to=1&jsonp=cb`;
+  const [r1, r2] = await Promise.all([fetchURL(url), fetchURL(urlEUR)]);
+  // Dukascopy returns JSONP: cb([...])
+  const parseJSONP = (body) => {
+    const match = body.match(/cb\((.*)\)/s);
+    if (!match) return null;
+    return jp(match[1]);
+  };
+  const d1 = parseJSONP(r1.body);
+  const d2 = parseJSONP(r2.body);
+  if (d1 && d1[0] && d2 && d2[0]) {
+    const xauUsd = parseFloat(d1[0][4]); // close price
+    const eurUsd = parseFloat(d2[0][4]);
+    if (xauUsd > 1000 && eurUsd > 0.5) {
+      const xauEur = xauUsd / eurUsd;
+      console.log(`Dukascopy: XAU/USD=${xauUsd} EUR/USD=${eurUsd} XAU/EUR=${xauEur.toFixed(2)}`);
+      return { price: xauEur, symbol: 'XAU/EUR (Dukascopy)' };
+    }
+  }
+  throw new Error('Dukascopy parse failed');
+}
+
 async function getPrice() {
+  // Try Dukascopy first — real-time, no cache
+  try {
+    const result = await getPriceDukascopy();
+    return result;
+  } catch(e) {
+    console.log('Dukascopy failed:', e.message);
+  }
+  // Fallback: TwelveData
   for (const sym of SYMBOLS) {
     try {
       const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}`);
