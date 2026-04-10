@@ -1,12 +1,15 @@
 const http = require('http');
 const https = require('https');
+const WebSocket = require('ws');
 const TD_KEY = '10b3ff3aa4b444ae85d350902c523b0f';
 const AV_KEY = 'TQPE9U0FIFDWE8ZY';
 const PORT = process.env.PORT || 3000;
 
-// ── SSE CLIENTS ───────────────────────────────────────────────────────────────
+// ── SSE CLIENTS & WEBSOCKET BRIDGE ───────────────────────────────────────────
 const sseClients = new Set();
 let lastPrice = null;
+let tdWs = null;
+let wsReady = false;
 
 function broadcastPrice(price, symbol) {
   lastPrice = { price, symbol, ts: new Date().toISOString() };
@@ -14,15 +17,52 @@ function broadcastPrice(price, symbol) {
   sseClients.forEach(client => {
     try { client.write(data); } catch(e) { sseClients.delete(client); }
   });
+  console.log(`[PRICE] ${symbol} = ${price.toFixed(2)}`);
 }
 
-// Poll TwelveData every 10s and broadcast to SSE clients
-async function pollAndBroadcast() {
+function connectTwelveDataWS() {
+  if(tdWs && (tdWs.readyState === WebSocket.OPEN || tdWs.readyState === WebSocket.CONNECTING)) return;
+  console.log('[WS] Connecting to TwelveData...');
   try {
-    const result = await getPrice();
-    broadcastPrice(result.price, result.symbol);
-  } catch(e) {}
-  setTimeout(pollAndBroadcast, 10000);
+    tdWs = new WebSocket('wss://ws.twelvedata.com/v1/quotes/price?apikey=' + TD_KEY);
+    tdWs.on('open', () => {
+      console.log('[WS] Connected — subscribing XAU/EUR');
+      tdWs.send(JSON.stringify({ action: 'subscribe', params: { symbols: 'XAU/EUR' } }));
+      wsReady = true;
+    });
+    tdWs.on('message', (data) => {
+      try {
+        const d = JSON.parse(data.toString());
+        if(d.event === 'price' && d.symbol === 'XAU/EUR' && d.price) {
+          broadcastPrice(parseFloat(d.price), 'XAU/EUR WS');
+        }
+      } catch(e) {}
+    });
+    tdWs.on('close', () => {
+      console.log('[WS] Closed — reconnecting in 5s');
+      wsReady = false; tdWs = null;
+      setTimeout(connectTwelveDataWS, 5000);
+    });
+    tdWs.on('error', (e) => {
+      console.log('[WS] Error:', e.message);
+      wsReady = false; tdWs = null;
+      setTimeout(connectTwelveDataWS, 5000);
+    });
+  } catch(e) {
+    console.log('[WS] Failed:', e.message);
+    setTimeout(connectTwelveDataWS, 5000);
+  }
+}
+
+// Fallback HTTP poll every 15s if WebSocket not active
+async function pollAndBroadcast() {
+  if(!wsReady) {
+    try {
+      const result = await getPrice();
+      broadcastPrice(result.price, result.symbol);
+    } catch(e) {}
+  }
+  setTimeout(pollAndBroadcast, 15000);
 }
 
 // ── Generic fetch ─────────────────────────────────────────────────────────────
@@ -605,5 +645,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`NM Trading Proxy v5 — port ${PORT}`);
-  setTimeout(pollAndBroadcast, 2000);
+  connectTwelveDataWS();
+  setTimeout(pollAndBroadcast, 3000);
 });
