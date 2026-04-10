@@ -1,8 +1,61 @@
 const http = require('http');
 const https = require('https');
+const WebSocket = require('ws');
 const TD_KEY = '10b3ff3aa4b444ae85d350902c523b0f';
 const AV_KEY = 'TQPE9U0FIFDWE8ZY';
 const PORT = process.env.PORT || 3000;
+
+// ── SSE CLIENTS & WEBSOCKET BRIDGE ───────────────────────────────────────────
+const sseClients = new Set();
+let lastPrice = null;
+let tdWebSocket = null;
+
+function broadcastPrice(price, symbol) {
+  lastPrice = { price, symbol, ts: new Date().toISOString() };
+  const data = `data: ${JSON.stringify(lastPrice)}\n\n`;
+  sseClients.forEach(client => {
+    try { client.write(data); } catch(e) { sseClients.delete(client); }
+  });
+}
+
+function connectTwelveDataWS() {
+  if(tdWebSocket && tdWebSocket.readyState === WebSocket.OPEN) return;
+  console.log('[WS] Connecting to TwelveData WebSocket...');
+  try {
+    const ws = new WebSocket(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${TD_KEY}`);
+    tdWebSocket = ws;
+    ws.on('open', () => {
+      console.log('[WS] Connected to TwelveData');
+      ws.send(JSON.stringify({ action: 'subscribe', params: { symbols: 'XAU/EUR' } }));
+    });
+    ws.on('message', (data) => {
+      try {
+        const d = JSON.parse(data.toString());
+        if(d.event === 'price' && d.symbol === 'XAU/EUR') {
+          const price = parseFloat(d.price) - 5; // bid correction
+          console.log(`[WS] XAU/EUR = ${price.toFixed(2)}`);
+          broadcastPrice(price, 'XAU/EUR');
+        }
+      } catch(e) {}
+    });
+    ws.on('close', () => {
+      console.log('[WS] Disconnected — reconnecting in 3s');
+      tdWebSocket = null;
+      setTimeout(connectTwelveDataWS, 3000);
+    });
+    ws.on('error', (e) => {
+      console.log('[WS] Error:', e.message);
+      tdWebSocket = null;
+      setTimeout(connectTwelveDataWS, 5000);
+    });
+  } catch(e) {
+    console.log('[WS] Failed to connect:', e.message);
+    setTimeout(connectTwelveDataWS, 5000);
+  }
+}
+
+// Start WebSocket connection immediately
+connectTwelveDataWS();
 
 // ── Generic fetch ─────────────────────────────────────────────────────────────
 function fetchURL(url, extraHeaders) {
@@ -409,13 +462,47 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200); res.end(JSON.stringify(await insiderRadar())); return;
     }
 
+    // ── Dukascopy real-time XAU/EUR (/dukascopy/price) ──────────────────────
+    if (rawPath === '/dukascopy/price') {
+      try {
+        const now = Date.now();
+        const [rXAU, rEUR] = await Promise.all([
+          fetchURL(`https://freeserv.dukascopy.com/2.0/?path=chart/json&instrument=XAU%2FUSD&offer_side=B&interval=1&time=${now}&from=0&to=1&jsonp=a`),
+          fetchURL(`https://freeserv.dukascopy.com/2.0/?path=chart/json&instrument=EUR%2FUSD&offer_side=B&interval=1&time=${now}&from=0&to=1&jsonp=a`)
+        ]);
+        const parseJSONP = (body) => {
+          const m = body.match(/a\(([\s\S]*)\)/);
+          return m ? jp(m[1]) : null;
+        };
+        const dXAU = parseJSONP(rXAU.body);
+        const dEUR = parseJSONP(rEUR.body);
+        if (dXAU && dXAU[0] && dEUR && dEUR[0]) {
+          const xauUsd = parseFloat(dXAU[0][4]);
+          const eurUsd = parseFloat(dEUR[0][4]);
+          const xauEur = xauUsd / eurUsd;
+          console.log(`[DK] XAU/USD=${xauUsd} EUR/USD=${eurUsd} XAU/EUR=${xauEur.toFixed(2)}`);
+          res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          res.writeHead(200);
+          res.end(JSON.stringify({ price: xauEur, source: 'Dukascopy', ts: new Date().toISOString() }));
+          return;
+        }
+      } catch(e) { console.log('Dukascopy error:', e.message); }
+      // Fallback
+      try {
+        const result = await getPrice();
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.writeHead(200);
+        res.end(JSON.stringify({ price: result.price - 5, source: result.symbol, ts: new Date().toISOString() }));
+      } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
+      return;
+    }
+
     // XAU/EUR gold dashboard
     if (rawPath === '/price') {
       const result = await getPrice();
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.writeHead(200);
-      // Apply -5 correction to match Goliath bid price (TwelveData = mid-price, Goliath = bid)
       const correctedPrice = result.price - 5;
       res.end(JSON.stringify({ price: correctedPrice, source: result.symbol, symbol: result.symbol, ts: new Date().toISOString() }));
       return;
@@ -487,6 +574,23 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200);
       res.end(JSON.stringify({ price: 104.5, change: 0, pct: 0, error: e.message }));
     }
+    return;
+  }
+
+  // ── SSE Stream (/stream) ──────────────────────────────────────────────────
+  if (rawPath === '/stream') {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.writeHead(200);
+    if(lastPrice) res.write('data: ' + JSON.stringify(lastPrice) + '\n\n');
+    else res.write('data: ' + JSON.stringify({price:0,symbol:'connecting',ts:new Date().toISOString()}) + '\n\n');
+    sseClients.add(res);
+    const heartbeat = setInterval(() => {
+      try { res.write(':heartbeat\n\n'); } catch(e) { clearInterval(heartbeat); sseClients.delete(res); }
+    }, 15000);
+    req.on('close', () => { sseClients.delete(res); clearInterval(heartbeat); });
     return;
   }
 
