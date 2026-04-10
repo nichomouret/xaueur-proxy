@@ -95,7 +95,7 @@ async function getPrice() {
   // Try TwelveData /quote (more real-time than /price)
   for (const sym of ['XAU/EUR', 'XAUEUR']) {
     try {
-      const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}`;
+      const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&t=${Date.now()}`;
       const r = await fetchURL(url);
       const d = jp(r.body);
       const p = parseFloat(d && (d.close || d.price));
@@ -108,7 +108,7 @@ async function getPrice() {
   // Fallback: /price endpoint
   for (const sym of SYMBOLS) {
     try {
-      const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}`);
+      const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&t=${Date.now()}`);
       const d = jp(r.body);
       const p = parseFloat(d && d.price);
       if (p > 100 && p < 100000) return { price: p, symbol: sym };
@@ -512,7 +512,7 @@ const server = http.createServer(async (req, res) => {
       const results = {};
       for (const sym of SYMBOLS) {
         try {
-          const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}`);
+          const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&t=${Date.now()}`);
           results[sym] = jp(r.body);
         } catch(e) { results[sym] = { error: e.message }; }
       }
