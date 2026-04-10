@@ -85,14 +85,27 @@ async function getPriceDukascopy() {
 }
 
 async function getPrice() {
-  // Try Dukascopy first — real-time, no cache
+  // Try Dukascopy first
   try {
     const result = await getPriceDukascopy();
     return result;
   } catch(e) {
     console.log('Dukascopy failed:', e.message);
   }
-  // Fallback: TwelveData
+  // Try TwelveData /quote (more real-time than /price)
+  for (const sym of ['XAU/EUR', 'XAUEUR']) {
+    try {
+      const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}`;
+      const r = await fetchURL(url);
+      const d = jp(r.body);
+      const p = parseFloat(d && (d.close || d.price));
+      if (p > 100 && p < 100000) {
+        console.log(`TwelveData quote: ${sym} = ${p}`);
+        return { price: p, symbol: sym + ' (quote)' };
+      }
+    } catch(e) { console.log(`quote ${sym} failed: ${e.message}`); }
+  }
+  // Fallback: /price endpoint
   for (const sym of SYMBOLS) {
     try {
       const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}`);
@@ -402,7 +415,9 @@ const server = http.createServer(async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.writeHead(200);
-      res.end(JSON.stringify({ price: result.price, source: result.symbol, symbol: result.symbol, ts: new Date().toISOString() }));
+      // Apply -5 correction to match Goliath bid price (TwelveData = mid-price, Goliath = bid)
+      const correctedPrice = result.price - 5;
+      res.end(JSON.stringify({ price: correctedPrice, source: result.symbol, symbol: result.symbol, ts: new Date().toISOString() }));
       return;
     }
 
