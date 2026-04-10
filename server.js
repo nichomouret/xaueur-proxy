@@ -1,4 +1,4 @@
-const http = require('http') ; 
+const http = require('http');
 const https = require('https');
 const TD_KEY = '10b3ff3aa4b444ae85d350902c523b0f';
 const AV_KEY = 'TQPE9U0FIFDWE8ZY';
@@ -460,7 +460,7 @@ const server = http.createServer(async (req, res) => {
         const result = await getPrice();
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
         res.writeHead(200);
-        res.end(JSON.stringify({ price: result.price - 5, source: result.symbol, ts: new Date().toISOString() }));
+        res.end(JSON.stringify({ price: result.price, source: result.symbol, ts: new Date().toISOString() }));
       } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
       return;
     }
@@ -471,8 +471,7 @@ const server = http.createServer(async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.writeHead(200);
-      const correctedPrice = result.price - 5;
-      res.end(JSON.stringify({ price: correctedPrice, source: result.symbol, symbol: result.symbol, ts: new Date().toISOString() }));
+      res.end(JSON.stringify({ price: result.price, source: result.symbol, symbol: result.symbol, ts: new Date().toISOString() }));
       return;
     }
 
