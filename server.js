@@ -109,36 +109,57 @@ async function getPriceDukascopy() {
 }
 
 async function getPrice() {
-  // Try Dukascopy first
+  // Source 1: Dukascopy — vrai temps réel
   try {
     const result = await getPriceDukascopy();
-    return result;
-  } catch(e) {
-    console.log('Dukascopy failed:', e.message);
-  }
-  // Try TwelveData /quote (more real-time than /price)
+    if(result && result.price > 3000 && result.price < 6000) return result;
+  } catch(e) { console.log('Dukascopy failed:', e.message); }
+
+  // Source 2: Metals-API / open metals data
+  try {
+    const r = await fetchURL('https://api.metals.live/v1/spot/gold');
+    const d = jp(r.body);
+    if(d && d[0] && d[0].price) {
+      // metals.live returns USD/oz — convert to EUR
+      const xauUsd = parseFloat(d[0].price);
+      // Get EUR/USD
+      const rEur = await fetchURL(`https://api.twelvedata.com/price?symbol=EUR/USD&apikey=${TD_KEY}&t=${Date.now()}`);
+      const dEur = jp(rEur.body);
+      const eurUsd = parseFloat(dEur && dEur.price);
+      if(xauUsd > 1000 && eurUsd > 0.5) {
+        const xauEur = xauUsd / eurUsd;
+        console.log('metals.live: XAU/USD=' + xauUsd + ' EUR/USD=' + eurUsd + ' XAU/EUR=' + xauEur.toFixed(2));
+        return { price: xauEur, symbol: 'XAU/EUR (metals.live)' };
+      }
+    }
+  } catch(e) { console.log('metals.live failed:', e.message); }
+
+  // Source 3: TwelveData time_series dernière bougie (plus frais que /quote)
+  try {
+    const url = `https://api.twelvedata.com/time_series?symbol=XAU/EUR&interval=1min&outputsize=1&apikey=${TD_KEY}&t=${Date.now()}`;
+    const r = await fetchURL(url);
+    const d = jp(r.body);
+    if(d && d.values && d.values[0]) {
+      const p = parseFloat(d.values[0].close);
+      if(p > 3000 && p < 6000) {
+        console.log('TwelveData 1min: XAU/EUR=' + p);
+        return { price: p, symbol: 'XAU/EUR (1min)' };
+      }
+    }
+  } catch(e) { console.log('time_series failed:', e.message); }
+
+  // Source 4: TwelveData quote fallback
   for (const sym of ['XAU/EUR', 'XAUEUR']) {
     try {
       const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&t=${Date.now()}`;
       const r = await fetchURL(url);
       const d = jp(r.body);
       const p = parseFloat(d && (d.close || d.price));
-      if (p > 100 && p < 100000) {
-        console.log(`TwelveData quote: ${sym} = ${p}`);
-        return { price: p, symbol: sym + ' (quote)' };
-      }
-    } catch(e) { console.log(`quote ${sym} failed: ${e.message}`); }
+      if (p > 100 && p < 100000) return { price: p, symbol: sym + ' (quote)' };
+    } catch(e) {}
   }
-  // Fallback: /price endpoint
-  for (const sym of SYMBOLS) {
-    try {
-      const r = await fetchURL(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&t=${Date.now()}`);
-      const d = jp(r.body);
-      const p = parseFloat(d && d.price);
-      if (p > 100 && p < 100000) return { price: p, symbol: sym };
-    } catch(e) { console.log(`${sym} failed: ${e.message}`); }
-  }
-  throw new Error('All XAU symbols failed');
+
+  throw new Error('All sources failed');
 }
 
 // ── TwelveData proxy (/td/*) ──────────────────────────────────────────────────
