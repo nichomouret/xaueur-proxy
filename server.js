@@ -399,8 +399,10 @@ const server = http.createServer(async (req, res) => {
     // XAU/EUR gold dashboard
     if (rawPath === '/price') {
       const result = await getPrice();
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
       res.writeHead(200);
-      res.end(JSON.stringify({ price: result.price, source: `TwelveData (${result.symbol})`, symbol: result.symbol, ts: new Date().toISOString() }));
+      res.end(JSON.stringify({ price: result.price, source: result.symbol, symbol: result.symbol, ts: new Date().toISOString() }));
       return;
     }
 
