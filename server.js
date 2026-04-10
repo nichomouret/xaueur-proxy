@@ -412,6 +412,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── DXY Dollar Index ──────────────────────────────────────────────────────
+  if (rawPath === '/dxy') {
+    try {
+      const symbols = ['DX-Y.NYB', 'USDX', 'DXY'];
+      let result = null;
+      for (const sym of symbols) {
+        try {
+          const r = await fetchURL(tdURL('/quote', 'symbol='+encodeURIComponent(sym)));
+          const d = jp(r.body);
+          if (d && d.close && !d.status) { result = d; break; }
+        } catch(e) {}
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify(result ? {
+        price: parseFloat(result.close),
+        change: parseFloat(result.change || 0),
+        pct: parseFloat(result.percent_change || 0),
+        source: 'TwelveData DXY', ts: new Date().toISOString()
+      } : { price: 104.5, change: 0, pct: 0, source: 'fallback' }));
+    } catch(e) {
+      res.writeHead(200);
+      res.end(JSON.stringify({ price: 104.5, change: 0, pct: 0, error: e.message }));
+    }
+    return;
+  }
+
   if (rawPath === '/health') {
       const result = await getPrice();
       res.writeHead(200);
