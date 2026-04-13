@@ -665,13 +665,13 @@ const server = http.createServer(async (req, res) => {
             const data = Buffer.from(body);
             const opts = {
               hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Content-Length': data.length, 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01' }
+              headers: { 'Content-Type': 'application/json', 'Content-Length': data.length, 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' }
             };
             const r = https.request(opts, (resp) => {
               let d = ''; resp.on('data', chunk => d += chunk); resp.on('end', () => resolve(d));
             });
             r.on('error', reject);
-            r.setTimeout(30000, () => { r.destroy(); reject(new Error('Claude timeout')); });
+            r.setTimeout(60000, () => { r.destroy(); reject(new Error('Claude timeout')); });
             r.write(data); r.end();
           });
           res.writeHead(200); res.end(response);
